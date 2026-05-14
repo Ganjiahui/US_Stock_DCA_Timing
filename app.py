@@ -39,8 +39,16 @@ def fetch_and_process_data(ticker, days=60, target_tz=None, interval="5m"):
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=days)
 
-    # Fetch interval-based data. 5m is for intraday mode, 1d is for multi-year trend mode.
-    df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
+    # Fetch interval-based data. For intraday intervals, include extended-hours bars.
+    include_extended = interval != "1d"
+    df = yf.download(
+        ticker,
+        start=start_date,
+        end=end_date,
+        interval=interval,
+        progress=False,
+        prepost=include_extended
+    )
     
     if df.empty:
         return None
@@ -58,6 +66,10 @@ def fetch_and_process_data(ticker, days=60, target_tz=None, interval="5m"):
     # Keep intraday timestamps timezone-aware; daily candles can remain date-like.
     force_utc = interval != "1d"
     df[time_col] = pd.to_datetime(df[time_col], errors='coerce', utc=force_utc)
+    if interval != "1d":
+        # Keep a stable ET timestamp for session filtering regardless of display timezone.
+        df['DateTime_ET'] = df[time_col].dt.tz_convert('US/Eastern')
+
     if target_tz and interval != "1d":
         try:
             df[time_col] = df[time_col].dt.tz_convert(target_tz)
@@ -66,14 +78,31 @@ def fetch_and_process_data(ticker, days=60, target_tz=None, interval="5m"):
             df[time_col] = df[time_col].dt.tz_localize('UTC').dt.tz_convert(target_tz)
 
     # Feature Engineering
-    df['Time'] = df[time_col].dt.time
-    df['Date_Only'] = df[time_col].dt.date
+    if interval != "1d":
+        # Always keep the market-session date in US/Eastern so sessions and opens are not split by display timezone.
+        df['Date_Only'] = df['DateTime_ET'].dt.date
+        df['Time_ET'] = df['DateTime_ET'].dt.time
+        if target_tz:
+            df['Time_Display'] = df[time_col].dt.time
+        else:
+            df['Time_Display'] = df['Time_ET']
+    else:
+        df['Date_Only'] = df[time_col].dt.date
+        df['Time_ET'] = df[time_col].dt.time
+        df['Time_Display'] = df['Time_ET']
     
-    # Ensure we only use full trading days (simplification for market hours)
-    # Calculate % change from the daily open to find intraday structure
+    return df
+
+def prepare_intraday_analysis(df):
+    df = df.copy()
+    if 'DateTime_ET' not in df.columns:
+        return df
+
+    # Recompute session-relative open using the filtered intraday rows.
+    df['Date_Only'] = df['DateTime_ET'].dt.date
     df['Daily_Open'] = df.groupby('Date_Only')['Open'].transform('first')
     df['Dev_From_Open_Pct'] = ((df['Close'] - df['Daily_Open']) / df['Daily_Open']) * 100
-    
+    df['Time'] = df['Time_ET']
     return df
 
 def analyze_patterns(df):
@@ -90,6 +119,33 @@ def analyze_patterns(df):
     time_stats = time_stats[time_stats['Count'] >= (max_count * 0.8)]
     
     return time_stats
+
+def filter_intraday_by_session(df, session_key):
+    if 'DateTime_ET' not in df.columns:
+        return df
+
+    if session_key == "whole_day":
+        # Keep all available intraday bars for full-day analysis.
+        return df.copy()
+
+    et_time = df['DateTime_ET'].dt.time
+    pre_start = datetime.time(4, 0)
+    regular_start = datetime.time(9, 30)
+    regular_end = datetime.time(16, 0)
+    post_end = datetime.time(20, 0)
+
+    if session_key == "premarket":
+        mask = (et_time >= pre_start) & (et_time < regular_start)
+    elif session_key == "regular":
+        mask = (et_time >= regular_start) & (et_time < regular_end)
+    elif session_key == "postmarket":
+        mask = (et_time >= regular_end) & (et_time < post_end)
+    elif session_key == "extended":
+        mask = (et_time >= pre_start) & (et_time < post_end)
+    else:
+        mask = pd.Series(True, index=df.index)
+
+    return df.loc[mask].copy()
 
 # --- USER INTERFACE ---
 st.title("⚡ Intraday DCA Timing Optimizer")
@@ -117,9 +173,30 @@ with st.sidebar:
     dca_amount = st.number_input("DCA Order Size ($)", min_value=10, max_value=10000, value=1000, step=100)
     fee_pct = st.number_input("Brokerage Fee (%)", min_value=0.0, max_value=2.0, value=0.1, step=0.05)
     st.divider()
-    # Time display option: allow user to view Malaysia time (UTC+8)
-    tz_option = st.selectbox("Display Timezone", options=["Original (UTC)", "Malaysia (UTC+8)"], index=0)
-    target_tz = 'Asia/Kuala_Lumpur' if tz_option == 'Malaysia (UTC+8)' else None
+    tz_option = st.selectbox(
+        "Display Timezone",
+        options=["US Market Time (ET)", "Malaysia (UTC+8)"],
+        index=0,
+        help="US stocks open at 09:30 ET and close at 16:00 ET during regular market hours."
+    )
+    tz_map = {
+        "US Market Time (ET)": "US/Eastern",
+        "Malaysia (UTC+8)": "Asia/Kuala_Lumpur"
+    }
+    target_tz = tz_map[tz_option]
+    session_options = {
+        "Regular (09:30-16:00 ET)": "regular",
+        "Premarket (04:00-09:30 ET)": "premarket",
+        "Postmarket (16:00-20:00 ET)": "postmarket",
+        "Whole Day (all available intraday bars)": "whole_day"
+    }
+    session_label = st.selectbox(
+        "Trading Session",
+        options=list(session_options.keys()),
+        index=0,
+        help="Session boundaries are based on US Market Time (ET)."
+    )
+    session_key = session_options[session_label]
 
 if not ticker:
     st.warning("Please enter a valid ticker symbol.")
@@ -163,38 +240,42 @@ if show_daily_trend:
 if intraday_df is None or intraday_df.empty:
     st.error(f"Failed to fetch data for {ticker}. It might be delisted, or Yahoo Finance is blocking the request.")
 else:
+    intraday_df = filter_intraday_by_session(intraday_df, session_key)
+    if intraday_df.empty:
+        st.error(
+            f"No intraday rows found for {session_label} in the selected range. "
+            "Try a different ticker, session, or date range."
+        )
+        st.stop()
+
+    intraday_df = prepare_intraday_analysis(intraday_df)
+
     # --- INTRADAY TIMING ANALYSIS (always shown) ---
     pattern_df = analyze_patterns(intraday_df)
 
     # Sort chronologically by Time so x-axis ordering matches human expectation
     pattern_df = pattern_df.sort_values(by='Time').reset_index(drop=True)
 
-    # Create consistent time string used for plotting and annotation so x-values match exactly
-    pattern_df['Time_Str'] = pattern_df['Time'].apply(lambda t: t.strftime('%H:%M') if hasattr(t, 'strftime') else str(t))
+    # Create consistent ET time string for analysis and a separate display string for the chosen timezone.
+    pattern_df['Time_ET_Str'] = pattern_df['Time'].apply(lambda t: t.strftime('%H:%M') if hasattr(t, 'strftime') else str(t))
+    if tz_option == "US Market Time (ET)":
+        pattern_df['Time_Str'] = pattern_df['Time_ET_Str']
+    else:
+        reference_date = intraday_df['Date_Only'].max() if 'Date_Only' in intraday_df.columns else datetime.datetime.now().date()
+        pattern_df['Time_Str'] = pattern_df['Time_ET_Str'].apply(
+            lambda t: convert_time_str_between_timezones(t, 'US/Eastern', target_tz, base_date=reference_date) or t
+        )
 
     # Find Optimal Times (recompute after sorting to avoid index confusion)
     best_time_row = pattern_df.loc[pattern_df['Avg_Dev_Pct'].idxmin()]
     worst_time_row = pattern_df.loc[pattern_df['Avg_Dev_Pct'].idxmax()]
 
-    best_time_str = best_time_row['Time'].strftime('%H:%M') if hasattr(best_time_row['Time'], 'strftime') else str(best_time_row['Time'])
-    worst_time_str = worst_time_row['Time'].strftime('%H:%M') if hasattr(worst_time_row['Time'], 'strftime') else str(worst_time_row['Time'])
+    best_time_et_str = best_time_row['Time'].strftime('%H:%M') if hasattr(best_time_row['Time'], 'strftime') else str(best_time_row['Time'])
+    worst_time_et_str = worst_time_row['Time'].strftime('%H:%M') if hasattr(worst_time_row['Time'], 'strftime') else str(worst_time_row['Time'])
+    best_time_str = best_time_row['Time_Str']
+    worst_time_str = worst_time_row['Time_Str']
     edge_pct = worst_time_row['Avg_Dev_Pct'] - best_time_row['Avg_Dev_Pct']
 
-    # Use the latest analyzed market date so DST conversion reflects the dataset period.
-    ny_reference_date = intraday_df['Date_Only'].max() if 'Date_Only' in intraday_df.columns else datetime.datetime.now().date()
-    best_time_my_from_ny = convert_time_str_between_timezones(
-        best_time_str,
-        from_tz='US/Eastern',
-        to_tz='Asia/Kuala_Lumpur',
-        base_date=ny_reference_date
-    )
-    worst_time_my_from_ny = convert_time_str_between_timezones(
-        worst_time_str,
-        from_tz='US/Eastern',
-        to_tz='Asia/Kuala_Lumpur',
-        base_date=ny_reference_date
-    )
-    
     # Calculate simulated metrics
     fee_cost = dca_amount * (fee_pct / 100)
     savings_per_order = dca_amount * (edge_pct / 100)
@@ -214,14 +295,13 @@ else:
     # Main Chart
     st.subheader(f"📊 Intraday Price Behavior for {ticker}")
     st.markdown(
-        f"This chart shows the average percentage deviation from the daily opening price at each {intraday_label} bucket."
+        f"This chart shows the average percentage deviation from the daily opening price at each {intraday_label} bucket for {session_label}."
     )
-    st.caption(f"Times shown in: {tz_option}")
-    if best_time_my_from_ny and worst_time_my_from_ny:
-        st.caption(
-            f"NY (US/Eastern) -> Malaysia (DST-aware): Best {best_time_str} -> {best_time_my_from_ny}, "
-            f"Worst {worst_time_str} -> {worst_time_my_from_ny}"
-        )
+    st.caption(f"Analysis timebase: US Market Time (ET) | Times shown in: {tz_option} | Session filter: {session_label}")
+    if tz_option == "US Market Time (ET)":
+        st.caption("Regular US market session: 09:30 to 16:00 ET.")
+    if intraday_interval == "1h" and session_key == "regular":
+        st.caption("For 1-hour bars, 15:30 ET is the final regular-session bucket label before 16:00 close.")
     
     # Plotly Line Chart
     fig = px.line(
