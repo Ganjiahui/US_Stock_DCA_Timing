@@ -7,6 +7,15 @@ import datetime
 import numpy as np
 
 
+def safe_tz_convert(series, tz_name):
+    """Safely convert a tz-aware datetime series to target timezone across environments."""
+    try:
+        return series.dt.tz_convert(tz_name)
+    except Exception:
+        import pytz
+        return series.dt.tz_convert(pytz.timezone(tz_name))
+
+
 def convert_time_str_between_timezones(time_str, from_tz, to_tz, base_date=None):
     """Convert an HH:MM time string between timezones with DST-aware rules."""
     if base_date is None:
@@ -68,14 +77,10 @@ def fetch_and_process_data(ticker, days=60, target_tz=None, interval="5m"):
     df[time_col] = pd.to_datetime(df[time_col], errors='coerce', utc=force_utc)
     if interval != "1d":
         # Keep a stable ET timestamp for session filtering regardless of display timezone.
-        df['DateTime_ET'] = df[time_col].dt.tz_convert('US/Eastern')
+        df['DateTime_ET'] = safe_tz_convert(df[time_col], 'US/Eastern')
 
     if target_tz and interval != "1d":
-        try:
-            df[time_col] = df[time_col].dt.tz_convert(target_tz)
-        except Exception:
-            # If conversion fails, try localize then convert
-            df[time_col] = df[time_col].dt.tz_localize('UTC').dt.tz_convert(target_tz)
+        df[time_col] = safe_tz_convert(df[time_col], target_tz)
 
     # Feature Engineering
     if interval != "1d":
